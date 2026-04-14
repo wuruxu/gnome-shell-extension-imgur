@@ -51,6 +51,14 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
         this._pendingCandidates = new Map();
         this._seenPaths = new Map();
         this._source = null;
+        this._latestScreenshotPath = null;
+
+        this._origAddNotification = MessageTray.Source.prototype.addNotification;
+        const extension = this;
+        MessageTray.Source.prototype.addNotification = function (notification) {
+            extension._maybeAttachUploadAction(notification, this);
+            return extension._origAddNotification.call(this, notification);
+        };
 
         this._startMonitoringScreenshotLocations();
     }
@@ -72,6 +80,11 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
             this._source.destroy();
             this._source = null;
         }
+        if (this._origAddNotification) {
+            MessageTray.Source.prototype.addNotification = this._origAddNotification;
+            this._origAddNotification = null;
+        }
+        this._latestScreenshotPath = null;
         this._clipboard = null;
         this._settings = null;
     }
@@ -192,25 +205,12 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
                 return;
 
             this._seenPaths.set(path, {size, modifiedSecs});
-            this._debug(`showUploadPrompt path=${path}`);
-            this._showUploadPrompt(path);
+            this._latestScreenshotPath = path;
+            this._debug(`latestScreenshotPath path=${path}`);
         } catch (error) {
             this._debug(`inspect error path=${path} error=${error.message}`);
             console.error(`${this.metadata.uuid}: failed to inspect ${path}: ${error.message}`);
         }
-    }
-
-    _showUploadPrompt(path) {
-        const basename = GLib.path_get_basename(path);
-        this._debug(`notify upload prompt basename=${basename}`);
-        const notification = this._createNotification(
-            'Screenshot captured',
-            basename
-        );
-        notification.addAction('Upload to Imgur', () => {
-            this._uploadScreenshot(path);
-        });
-        this._showNotification(notification);
     }
 
     async _uploadScreenshot(path) {
@@ -289,6 +289,36 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
         this._debug(`copyLink link=${link}`);
         this._clipboard.set_text(St.ClipboardType.CLIPBOARD, link);
         this._clipboard.set_text(St.ClipboardType.PRIMARY, link);
+    }
+
+    _maybeAttachUploadAction(notification, source) {
+        try {
+            const title = `${notification.title ?? ''}`;
+            const lowerTitle = title.toLowerCase();
+            const sourceTitle = `${source?.title ?? ''}`.toLowerCase();
+
+            const looksLikeScreenshotNotification =
+                lowerTitle.includes('screenshot captured') ||
+                (lowerTitle.includes('screenshot') && sourceTitle.includes('screenshot'));
+
+            if (!looksLikeScreenshotNotification)
+                return;
+
+            const path = this._latestScreenshotPath;
+            if (!path)
+                return;
+
+            const file = Gio.File.new_for_path(path);
+            if (!file.query_exists(null))
+                return;
+
+            this._debug(`attach upload action title=${title} path=${path}`);
+            notification.addAction('Upload to Imgur', () => {
+                this._uploadScreenshot(path);
+            });
+        } catch (error) {
+            this._debug(`attach action error=${error.message}`);
+        }
     }
 
     _getSource() {
