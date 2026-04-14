@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.imgur-screenshot-uploader"
+          path="/org/gnome/shell/extensions/imgur-screenshot-uploader/">
+    <key name="imgur-client-id" type="s">
+      <default>''</default>
+      <summary>Imgur client id</summary>
+      <description>Client ID used for anonymous Imgur uploads.</description>
+    </key>
+  </schema>
+</schemalist>

@@ -1,0 +1,8 @@
+{
+  "uuid": "imgur-screenshot-uploader49@local",
+  "name": "Imgur Screenshot Uploader",
+  "description": "Shows an upload action after GNOME screenshots and posts the image to Imgur.",
+  "shell-version": ["49", "50"],
+  "settings-schema": "org.gnome.shell.extensions.imgur-screenshot-uploader",
+  "url": "https://imgur.com/"
+}
