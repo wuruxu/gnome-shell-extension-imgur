@@ -15,3 +15,8 @@ GNOME Shell extension for GNOME 50 that watches new screenshot files, offers an 
 2. Make sure `schemas/gschemas.compiled` is present in that directory.
 3. Enable the extension with `gnome-extensions enable imgur-screenshot-uploader49@local`.
 4. Open extension preferences and fill in your Imgur `Client ID`.
+
+## Screenshot
+
+![Screenshot Uploader](./screenshot2imgur.png)
+
