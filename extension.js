@@ -1,6 +1,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Soup from 'gi://Soup';
 import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -9,8 +10,8 @@ import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 
 const SCREENSHOT_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp'];
 const SCREENSHOT_NAME_HINTS = ['screenshot', 'screen-shot', 'screen_shot', 'snapshot'];
-const DEBUG_LOG_PATH = '/tmp/imgur-screenshot-uploader.log';
 const CANDIDATE_DELAY_MS = 200;
+let soupSession = null;
 
 const NotificationPolicy = GObject.registerClass(
 class NotificationPolicy extends MessageTray.NotificationPolicy {
@@ -44,11 +45,11 @@ class NotificationPolicy extends MessageTray.NotificationPolicy {
 
 export default class ImgurScreenshotUploaderExtension extends Extension {
     enable() {
-        this._debug('enable()');
         this._settings = this.getSettings();
         this._clipboard = St.Clipboard.get_default();
         this._fileMonitors = [];
         this._pendingCandidates = new Map();
+        this._pendingNotificationRetries = new Map();
         this._seenPaths = new Map();
         this._source = null;
         this._latestScreenshotPath = null;
@@ -64,8 +65,6 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
     }
 
     disable() {
-        this._debug('disable()');
-
         for (const monitor of this._fileMonitors)
             monitor.cancel();
 
@@ -75,6 +74,9 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
             GLib.Source.remove(sourceId);
 
         this._pendingCandidates.clear();
+        for (const sourceId of this._pendingNotificationRetries.values())
+            GLib.Source.remove(sourceId);
+        this._pendingNotificationRetries.clear();
         this._seenPaths.clear();
         if (this._source) {
             this._source.destroy();
@@ -84,6 +86,10 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
             MessageTray.Source.prototype.addNotification = this._origAddNotification;
             this._origAddNotification = null;
         }
+        if (soupSession) {
+            soupSession.abort();
+            soupSession = null;
+        }
         this._latestScreenshotPath = null;
         this._clipboard = null;
         this._settings = null;
@@ -92,7 +98,6 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
     _startMonitoringScreenshotLocations() {
         const picturesDir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES);
         const paths = new Set();
-        this._debug(`picturesDir=${picturesDir ?? 'null'}`);
 
         if (picturesDir) {
             paths.add(picturesDir);
@@ -108,7 +113,6 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
 
         try {
             if (!file.query_exists(null)) {
-                this._debug(`monitor skip missing path=${path}`);
                 return;
             }
 
@@ -117,9 +121,7 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
                 this._onDirectoryChanged(changedFile, otherFile, eventType);
             });
             this._fileMonitors.push(monitor);
-            this._debug(`monitoring path=${path}`);
         } catch (error) {
-            this._debug(`monitor error path=${path} error=${error.message}`);
             console.error(`${this.metadata.uuid}: failed to monitor ${path}: ${error.message}`);
         }
     }
@@ -144,16 +146,13 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
 
         const path = file.get_path();
         if (!path) {
-            this._debug('queueCandidate without path');
             return;
         }
 
         if (!this._looksLikeScreenshotPath(path)) {
-            this._debug(`ignore non-screenshot path=${path}`);
             return;
         }
 
-        this._debug(`queueCandidate path=${path}`);
 
         if (this._pendingCandidates.has(path))
             GLib.Source.remove(this._pendingCandidates.get(path));
@@ -194,7 +193,6 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
 
             const modifiedSecs = info.get_attribute_uint64('time::modified');
             const ageSecs = Math.floor(GLib.get_real_time() / 1000000) - modifiedSecs;
-            this._debug(`inspect path=${path} ageSecs=${ageSecs} size=${info.get_size()}`);
 
             if (ageSecs > 15)
                 return;
@@ -206,15 +204,12 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
 
             this._seenPaths.set(path, {size, modifiedSecs});
             this._latestScreenshotPath = path;
-            this._debug(`latestScreenshotPath path=${path}`);
         } catch (error) {
-            this._debug(`inspect error path=${path} error=${error.message}`);
             console.error(`${this.metadata.uuid}: failed to inspect ${path}: ${error.message}`);
         }
     }
 
     async _uploadScreenshot(path) {
-        this._debug(`upload requested path=${path}`);
         const clientId = this._settings.get_string('imgur-client-id').trim();
         if (!clientId) {
             this._showNotification(this._createNotification(
@@ -226,7 +221,6 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
 
         try {
             const link = await this._runImgurUpload(path, clientId);
-            this._debug(`upload success path=${path} link=${link}`);
             const notification = this._createNotification(
                 'Imgur upload complete',
                 link
@@ -236,7 +230,6 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
             });
             this._showNotification(notification);
         } catch (error) {
-            this._debug(`upload failed path=${path} error=${error.message}`);
             this._showNotification(this._createNotification(
                 'Imgur upload failed',
                 error.message
@@ -246,53 +239,91 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
 
     _runImgurUpload(path, clientId) {
         return new Promise((resolve, reject) => {
-            let proc;
             try {
-                proc = Gio.Subprocess.new(
-                    [
-                        'curl',
-                        '--silent',
-                        '--show-error',
-                        '--fail-with-body',
-                        'https://api.imgur.com/3/image',
-                        '-H',
-                        `Authorization: Client-ID ${clientId}`,
-                        '-F',
-                        `image=@${path}`,
-                    ],
-                    Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+                if (!soupSession) {
+                    soupSession = new Soup.Session({
+                        user_agent: 'gnome-shell-extension-imgur/1.0',
+                    });
+                }
+
+                const file = Gio.File.new_for_path(path);
+                const [bytes] = file.load_bytes(null);
+                const basename = GLib.path_get_basename(path);
+                const multipart = new Soup.Multipart('multipart/form-data');
+                multipart.append_form_file(
+                    'image',
+                    basename,
+                    this._guessContentType(path),
+                    bytes
                 );
+
+                const message = Soup.Message.new_from_multipart(
+                    'https://api.imgur.com/3/image',
+                    multipart
+                );
+
+                if (!message)
+                    throw new Error('Failed to create Imgur upload request');
+
+                message.request_headers.append(
+                    'Authorization',
+                    `Client-ID ${clientId}`
+                );
+
+                soupSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null, (session, result) => {
+                    try {
+                        const responseBytes = session.send_and_read_finish(result);
+                        const responseText = new TextDecoder().decode(responseBytes.get_data());
+                        const status = message.get_status();
+
+                        if (status < 200 || status >= 300) {
+                            let detail = message.get_reason_phrase() || `HTTP ${status}`;
+                            try {
+                                const errorPayload = JSON.parse(responseText);
+                                detail = errorPayload?.data?.error || errorPayload?.error || detail;
+                            } catch (_error) {
+                            }
+                            throw new Error(detail);
+                        }
+
+                        const payload = JSON.parse(responseText);
+                        if (!payload?.success || !payload?.data?.link)
+                            throw new Error(payload?.data?.error || 'Imgur response did not contain a link');
+
+                        resolve(payload.data.link);
+                    } catch (error) {
+                        reject(error);
+                    }
+                });
             } catch (error) {
                 reject(error);
-                return;
             }
-
-            proc.communicate_utf8_async(null, null, (subprocess, result) => {
-                try {
-                    const [, stdout, stderr] = subprocess.communicate_utf8_finish(result);
-                    if (!subprocess.get_successful())
-                        throw new Error(stderr.trim() || stdout.trim() || 'curl exited with a failure status');
-
-                    const payload = JSON.parse(stdout);
-                    if (!payload?.success || !payload?.data?.link)
-                        throw new Error(payload?.data?.error || 'Imgur response did not contain a link');
-
-                    resolve(payload.data.link);
-                } catch (error) {
-                    reject(error);
-                }
-            });
         });
     }
 
+    _guessContentType(path) {
+        const lowerPath = path.toLowerCase();
+
+        if (lowerPath.endsWith('.png'))
+            return 'image/png';
+        if (lowerPath.endsWith('.jpg') || lowerPath.endsWith('.jpeg'))
+            return 'image/jpeg';
+        if (lowerPath.endsWith('.webp'))
+            return 'image/webp';
+
+        return 'application/octet-stream';
+    }
+
     _copyLink(link) {
-        this._debug(`copyLink link=${link}`);
         this._clipboard.set_text(St.ClipboardType.CLIPBOARD, link);
         this._clipboard.set_text(St.ClipboardType.PRIMARY, link);
     }
 
     _maybeAttachUploadAction(notification, source) {
         try {
+            if (notification._imgurUploadActionAttached)
+                return;
+
             const title = `${notification.title ?? ''}`;
             const lowerTitle = title.toLowerCase();
             const sourceTitle = `${source?.title ?? ''}`.toLowerCase();
@@ -305,20 +336,60 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
                 return;
 
             const path = this._latestScreenshotPath;
-            if (!path)
+            if (!path) {
+                this._scheduleAttachRetry(notification);
                 return;
+            }
 
             const file = Gio.File.new_for_path(path);
-            if (!file.query_exists(null))
+            if (!file.query_exists(null)) {
+                this._scheduleAttachRetry(notification);
                 return;
+            }
 
-            this._debug(`attach upload action title=${title} path=${path}`);
-            notification.addAction('Upload to Imgur', () => {
+            notification._imgurUploadActionAttached = true;
+            notification.addAction('Upload To Imgur', () => {
                 this._uploadScreenshot(path);
             });
+            this._cancelAttachRetry(notification);
         } catch (error) {
-            this._debug(`attach action error=${error.message}`);
         }
+    }
+
+    _scheduleAttachRetry(notification) {
+        if (notification._imgurUploadActionAttached || this._pendingNotificationRetries.has(notification))
+            return;
+
+        notification._imgurUploadActionRetryCount = 0;
+
+        const sourceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+            if (notification._imgurUploadActionAttached) {
+                this._pendingNotificationRetries.delete(notification);
+                return GLib.SOURCE_REMOVE;
+            }
+
+            notification._imgurUploadActionRetryCount += 1;
+            this._maybeAttachUploadAction(notification, notification.source);
+
+            if (notification._imgurUploadActionAttached ||
+                notification._imgurUploadActionRetryCount >= 10) {
+                this._pendingNotificationRetries.delete(notification);
+                return GLib.SOURCE_REMOVE;
+            }
+
+            return GLib.SOURCE_CONTINUE;
+        });
+
+        this._pendingNotificationRetries.set(notification, sourceId);
+    }
+
+    _cancelAttachRetry(notification) {
+        const sourceId = this._pendingNotificationRetries.get(notification);
+        if (!sourceId)
+            return;
+
+        GLib.Source.remove(sourceId);
+        this._pendingNotificationRetries.delete(notification);
     }
 
     _getSource() {
@@ -348,22 +419,6 @@ export default class ImgurScreenshotUploaderExtension extends Extension {
     }
 
     _showNotification(notification) {
-        this._debug(`show notification title=${notification.title}`);
         this._getSource().addNotification(notification);
-    }
-
-    _debug(message) {
-        try {
-            const now = GLib.DateTime.new_now_local().format('%F %T');
-            const line = `[${now}] ${message}\n`;
-            let current = '';
-            try {
-                current = GLib.file_get_contents(DEBUG_LOG_PATH)[1];
-            } catch (_error) {
-            }
-
-            GLib.file_set_contents(DEBUG_LOG_PATH, `${current}${line}`);
-        } catch (_error) {
-        }
     }
 }
