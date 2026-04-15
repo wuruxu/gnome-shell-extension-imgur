@@ -4,14 +4,13 @@ GNOME Shell extension for GNOME 50 that watches new screenshot files, offers an 
 
 ## Notes
 
-- You must configure your own Imgur `Client ID` in the extension preferences.
+- You must configure your own Imgur `Client ID` in the extension preferences, run command 'gnome-extensions prefs imgur-screenshot-uploader49@local' to configure imgur client id
 - The extension monitors `~/Pictures` and `~/Pictures/Screenshots`.
 - Uploads are sent directly with `libsoup` via `gi://Soup`.
-- run command 'gnome-extensions prefs imgur-screenshot-uploader49@local' to config client id of your imgur
 
 ## Install
 
-1. Copy this directory to `~/.local/share/gnome-shell/extensions/imgur-screenshot-uploader49@local`.
+1. run command './install-local.sh'
 2. Make sure `schemas/gschemas.compiled` is present in that directory.
 3. Enable the extension with `gnome-extensions enable imgur-screenshot-uploader49@local`.
 4. Open extension preferences and fill in your Imgur `Client ID`.
